@@ -2,6 +2,8 @@ const express = require('express');
 const http = require('http');
 const socketIo = require('socket.io');
 const cors = require('cors');
+const fs = require('fs');
+const path = require('path');
 
 const app = express();
 const server = http.createServer(app);
@@ -15,67 +17,98 @@ const io = socketIo(server, {
 app.use(cors());
 app.use(express.json());
 
-// Store data
-const riders = new Map();
-const customers = new Map();
-const rides = new Map();
-const admins = new Set();
+// File-based storage (persists through restarts)
+const DATA_FILE = path.join(__dirname, 'data.json');
 
-// Test route
+// Load data from file
+let db = {
+  riders: {},
+  customers: {},
+  rides: {},
+  admins: { admin_001: { username: 'admin', password: 'admin123', name: 'Admin' } }
+};
+
+if (fs.existsSync(DATA_FILE)) {
+  try {
+    const saved = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
+    db = { ...db, ...saved };
+    console.log('📁 Loaded saved data');
+  } catch (e) {
+    console.log('No saved data, starting fresh');
+  }
+}
+
+// Save data to file
+function saveData() {
+  fs.writeFileSync(DATA_FILE, JSON.stringify(db, null, 2));
+  console.log('💾 Data saved');
+}
+
+// Auto-save every 30 seconds
+setInterval(saveData, 30000);
+
 app.get('/', (req, res) => {
   res.json({
     app: 'THE LAND RIDERS',
-    status: '🚀 LIVE & WORKING',
-    time: new Date().toISOString(),
+    status: '🚀 PERMANENT SERVER',
     stats: {
-      riders: riders.size,
-      customers: customers.size,
-      rides: rides.size
+      riders: Object.keys(db.riders).length,
+      customers: Object.keys(db.customers).length,
+      rides: Object.keys(db.rides).length,
+      lastUpdated: new Date().toISOString()
     }
   });
 });
 
 io.on('connection', (socket) => {
-  console.log('✅ New connection:', socket.id);
-  
+  console.log('🔌 New connection:', socket.id);
+
   socket.emit('connected', { message: 'Connected to LAND RIDERS', id: socket.id });
 
   // ==================== ADMIN ====================
   socket.on('admin_login', (data) => {
-    if (data.username === 'admin' && data.password === 'admin123') {
-      admins.add(socket.id);
-      console.log('👑 Admin logged in:', socket.id);
+    const admin = Object.values(db.admins).find(a => 
+      a.username === data.username && a.password === data.password
+    );
+    
+    if (admin) {
+      console.log('👑 Admin logged in:', data.username);
       
       socket.emit('admin_login_success', {
-        message: 'Admin login successful',
+        admin: { username: admin.username, name: admin.name },
         stats: {
-          totalRiders: riders.size,
-          onlineRiders: Array.from(riders.values()).filter(r => r.status === 'online').length,
-          totalCustomers: customers.size,
-          pendingRides: Array.from(rides.values()).filter(r => r.status === 'pending').length
-        }
+          totalRiders: Object.keys(db.riders).length,
+          totalCustomers: Object.keys(db.customers).length,
+          totalRides: Object.keys(db.rides).length
+        },
+        riders: Object.values(db.riders),
+        customers: Object.values(db.customers),
+        rides: Object.values(db.rides)
       });
+    } else {
+      socket.emit('admin_login_failed', { message: 'Invalid credentials' });
     }
   });
 
-  // Admin creates rider
   socket.on('create_rider', (data) => {
-    if (!admins.has(socket.id)) return;
-    
     const riderId = 'RDR' + Date.now() + Math.random().toString(36).substr(2, 4).toUpperCase();
-    const riderData = {
+    
+    db.riders[riderId] = {
       riderId,
       name: data.name,
       phone: data.phone,
       vehicle: data.vehicle,
       password: data.password,
       status: 'offline',
-      createdAt: new Date().toISOString()
+      earnings: 0,
+      totalRides: 0,
+      rating: 5.0,
+      createdAt: new Date().toISOString(),
+      createdBy: 'admin'
     };
     
-    riders.set(riderId, riderData);
-    
-    console.log('👑 Rider created:', riderId, data.name);
+    saveData();
+    console.log('✅ Rider created:', riderId, data.name);
     
     socket.emit('rider_created', {
       success: true,
@@ -91,13 +124,14 @@ io.on('connection', (socket) => {
 
   // ==================== RIDER ====================
   socket.on('rider_login', (data) => {
-    const rider = Array.from(riders.values()).find(r => r.riderId === data.riderId);
+    const rider = Object.values(db.riders).find(r => r.riderId === data.riderId);
     
     if (rider && rider.password === data.password) {
       rider.status = 'online';
-      rider.socketId = socket.id;
       rider.lastLogin = new Date().toISOString();
+      rider.socketId = socket.id;
       
+      saveData();
       console.log('🏍️ Rider logged in:', rider.name);
       
       socket.emit('rider_login_success', {
@@ -106,17 +140,10 @@ io.on('connection', (socket) => {
           name: rider.name,
           phone: rider.phone,
           vehicle: rider.vehicle,
-          status: 'online'
+          status: 'online',
+          earnings: rider.earnings,
+          totalRides: rider.totalRides
         }
-      });
-      
-      // Notify admins
-      admins.forEach(adminId => {
-        io.to(adminId).emit('rider_online', {
-          riderId: rider.riderId,
-          name: rider.name,
-          status: 'online'
-        });
       });
     } else {
       socket.emit('login_failed', { message: 'Invalid credentials' });
@@ -126,69 +153,96 @@ io.on('connection', (socket) => {
   // ==================== CUSTOMER ====================
   socket.on('customer_register', (data) => {
     const customerId = 'CUST' + Date.now();
-    const customerData = {
+    
+    db.customers[customerId] = {
       customerId,
       name: data.name,
       phone: data.phone,
       password: data.password,
       createdAt: new Date().toISOString(),
+      totalRides: 0,
       socketId: socket.id
     };
     
-    customers.set(customerId, customerData);
-    
+    saveData();
     console.log('👤 Customer registered:', data.name);
     
     socket.emit('register_success', {
-      customer: customerData
+      customer: {
+        customerId,
+        name: data.name,
+        phone: data.phone
+      }
     });
+  });
+
+  socket.on('customer_login', (data) => {
+    const customer = Object.values(db.customers).find(c => c.phone === data.phone);
+    
+    if (customer && customer.password === data.password) {
+      customer.socketId = socket.id;
+      customer.lastLogin = new Date().toISOString();
+      
+      saveData();
+      console.log('👤 Customer logged in:', customer.name);
+      
+      socket.emit('login_success', {
+        customer: {
+          name: customer.name,
+          phone: customer.phone,
+          customerId: customer.customerId,
+          totalRides: customer.totalRides || 0
+        }
+      });
+    } else {
+      socket.emit('login_failed', { message: 'Invalid credentials' });
+    }
   });
 
   socket.on('request_ride', (data) => {
     const rideId = 'RIDE' + Date.now();
-    const rideData = {
+    
+    db.rides[rideId] = {
       rideId,
+      customerId: data.customerId || 'guest',
       customerName: data.customerName || 'Customer',
       pickup: data.pickup,
       destination: data.destination,
       status: 'pending',
-      createdAt: new Date().toISOString()
+      createdAt: new Date().toISOString(),
+      offers: []
     };
     
-    rides.set(rideId, rideData);
-    
+    saveData();
     console.log('🚖 Ride requested:', rideId);
     
-    // Notify ALL online riders
-    const onlineRiders = Array.from(riders.values()).filter(r => r.status === 'online');
+    // Notify all online riders
+    const onlineRiders = Object.values(db.riders).filter(r => r.status === 'online');
     onlineRiders.forEach(rider => {
       if (rider.socketId) {
-        io.to(rider.socketId).emit('new_ride', {
-          ...rideData,
-          alert: 'NEW RIDE REQUEST!'
+        io.to(rider.socketId).emit('new_ride_request', {
+          rideId,
+          customerName: db.rides[rideId].customerName,
+          pickup: data.pickup,
+          destination: data.destination,
+          createdAt: new Date().toISOString()
         });
       }
     });
     
-    // Notify admins
-    admins.forEach(adminId => {
-      io.to(adminId).emit('new_ride_request', rideData);
-    });
-    
     socket.emit('ride_requested', {
       rideId,
-      message: 'Ride request sent to riders'
+      message: 'Ride request sent to available riders'
     });
   });
 
-  // ==================== DISCONNECT ====================
   socket.on('disconnect', () => {
     console.log('❌ Disconnected:', socket.id);
-    admins.delete(socket.id);
   });
 });
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
-  console.log(`🚀 Server running on port ${PORT}`);
+  console.log(`🚀 PERMANENT Server running on port ${PORT}`);
+  console.log(`📁 Data will be saved to: ${DATA_FILE}`);
 });
